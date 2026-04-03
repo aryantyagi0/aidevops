@@ -1,8 +1,3 @@
-"""
-AI Docker Deployment Agent — LangGraph Version
-Converts the original main5.py into a proper LangGraph state machine.
-Every function, every feature, every HITL checkpoint is preserved exactly.
-"""
 
 import requests
 import subprocess

@@ -1,10 +1,4 @@
 
-"""
-AI Docker Deployment Agent — LangGraph Version
-Converts the original main5.py into a proper LangGraph state machine.
-Every function, every feature, every HITL checkpoint is preserved exactly.
-"""
-
 import requests
 import subprocess
 import os
@@ -22,6 +16,18 @@ from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 
 load_dotenv()
+
+load_dotenv()
+
+import shutil as _shutil
+
+def _tool_ok(name):
+    return _shutil.which(name) is not None
+
+if not _tool_ok("git"):
+    raise EnvironmentError("git not found in PATH. Install Git before running the agent.")
+if not _tool_ok("docker"):
+    print("[Agent] ⚠️  docker not found in PATH — Docker tests will fail.")
 
 subprocess.run(["git", "config", "--global", "user.name", "AI-Agent"])
 subprocess.run(["git", "config", "--global", "user.email", "ai-agent@example.com"])
@@ -61,11 +67,14 @@ class AgentState(TypedDict):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _remove_readonly(func, path, _):
-    os.chmod(path, stat.S_IWRITE)
-    func(path)
+    try:
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+    except FileNotFoundError:
+        pass
 
 def safe_rmtree(path):
-    shutil.rmtree(path, onexc=_remove_readonly)
+    shutil.rmtree(path, onerror=_remove_readonly)
 
 def make_github_headers(token):
     return {
@@ -154,17 +163,20 @@ def fork_repo(repo_url, token):
 def download_repo(repo_url, fork_url, default_branch):
     print(f"[Agent] Cloning latest upstream default branch: {default_branch}")
     repo_name = repo_url.split("/")[-1].replace(".git", "")
-    if os.path.exists(repo_name):
-        safe_rmtree(repo_name)
+    WORKSPACE = os.path.join(os.path.expanduser("~"), "ai-devops-workspace")
+    os.makedirs(WORKSPACE, exist_ok=True)
+    repo_path = os.path.join(WORKSPACE, repo_name)
+    if os.path.exists(repo_path):
+        safe_rmtree(repo_path)
     subprocess.run(
-        ["git", "clone", "--branch", default_branch, "--single-branch", repo_url, repo_name],
+        ["git", "clone", "--branch", default_branch, "--single-branch", repo_url, repo_path],
         check=True
     )
-    subprocess.run(["git", "remote", "rename", "origin", "upstream"], cwd=repo_name, check=True)
-    subprocess.run(["git", "remote", "add", "origin", fork_url], cwd=repo_name, check=True)
-    print("[Agent] Repo cloned from upstream:", repo_name)
+    subprocess.run(["git", "remote", "rename", "origin", "upstream"], cwd=repo_path, check=True)
+    subprocess.run(["git", "remote", "add", "origin", fork_url], cwd=repo_path, check=True)
+    print("[Agent] Repo cloned from upstream:", repo_path)
     print("[Agent] Remotes configured: upstream=original repo, origin=fork")
-    return repo_name
+    return repo_path
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1384,11 +1396,27 @@ Output ONLY the fixed raw Dockerfile. No markdown, no backticks, no explanation.
     return True
 
 
+def _find_free_port(preferred):
+    """Return preferred port if free, otherwise find the next available one."""
+    import socket
+    if preferred is None:
+        return None
+    preferred = int(preferred)
+    for port in range(preferred, preferred + 20):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("", port))
+                return str(port)
+            except OSError:
+                continue
+    return str(preferred)  # fallback
+
+
 def test_docker_image(folder, app_name, context, openai_api_key, max_retries=3):
     ml_type        = context.get("ml_type", "unknown")
     framework      = context.get("detected_framework", "unknown")
     lang           = context.get("detected_language", "unknown")
-    test_port      = detect_port_from_dockerfile(folder)
+    test_port      = _find_free_port(detect_port_from_dockerfile(folder))
     image_tag      = f"{app_name}-test:latest"
     container_name = f"{app_name}-test-container"
 
@@ -1434,6 +1462,8 @@ def test_docker_image(folder, app_name, context, openai_api_key, max_retries=3):
                     print(f"[Test] ❌ All {max_retries} build attempts failed")
                     return False
                 
+    error_log = []  # accumulate errors across all attempts for nuclear round
+
     for attempt in range(1, max_retries + 1):
         print(f"\n[Test] ── Attempt {attempt}/{max_retries} ──────────────────────")
         print(f"[Test] Building image: {image_tag}")
@@ -1446,6 +1476,7 @@ def test_docker_image(folder, app_name, context, openai_api_key, max_retries=3):
         if build_result.returncode != 0:
             print(f"[Test] ❌ Build FAILED on attempt {attempt}")
             print(f"[Test] Build error:\n{build_result.stderr[-3000:]}")
+            error_log.append(f"Attempt {attempt} (build error): {build_result.stderr[-1000:]}")
             if attempt < max_retries:
                 print(f"[Test] 🔧 Asking GPT-4o to fix the Dockerfile...")
                 fixed = fix_dockerfile_with_llm(
@@ -1460,10 +1491,10 @@ def test_docker_image(folder, app_name, context, openai_api_key, max_retries=3):
                     break
             else:
                 print(f"[Test] ❌ All {max_retries} build attempts failed")
-                return False
+                break
 
         print(f"[Test] ✅ Image built successfully: {image_tag}")
-        test_port = detect_port_from_dockerfile(folder)
+        test_port = _find_free_port(detect_port_from_dockerfile(folder))
         print(f"[Test] Using port: {test_port}")
 
         if test_port is None:
@@ -1484,6 +1515,7 @@ def test_docker_image(folder, app_name, context, openai_api_key, max_retries=3):
             print(f"[Test] ❌ Container failed to start")
             logs = get_container_logs(container_name)
             print(f"[Test] Container logs:\n{logs}")
+            error_log.append(f"Attempt {attempt} (runtime exit): {logs or run_result.stderr}")
             if attempt < max_retries:
                 fix_dockerfile_with_llm(dockerfile_path, error_output=logs or run_result.stderr,
                                         error_type="runtime", context=context, openai_api_key=openai_api_key)
@@ -1491,7 +1523,7 @@ def test_docker_image(folder, app_name, context, openai_api_key, max_retries=3):
                 continue
             else:
                 cleanup_test_container(container_name, image_tag)
-                return False
+                break
 
         startup_wait = get_startup_wait(ml_type, framework)
         print(f"[Test] Waiting {startup_wait}s for app to start...")
@@ -1504,6 +1536,7 @@ def test_docker_image(folder, app_name, context, openai_api_key, max_retries=3):
             print(f"[Test] ❌ Container exited unexpectedly")
             logs = get_container_logs(container_name)
             print(f"[Test] Container logs:\n{logs}")
+            error_log.append(f"Attempt {attempt} (runtime exit): {logs}")
             if attempt < max_retries:
                 fix_dockerfile_with_llm(dockerfile_path, error_output=logs,
                                         error_type="runtime_exit", context=context, openai_api_key=openai_api_key)
@@ -1511,7 +1544,7 @@ def test_docker_image(folder, app_name, context, openai_api_key, max_retries=3):
                 continue
             else:
                 cleanup_test_container(container_name, image_tag)
-                return False
+                break
 
         print(f"[Test] Checking if app responds on http://localhost:{test_port} ...")
         health_ok = False
@@ -1533,6 +1566,7 @@ def test_docker_image(folder, app_name, context, openai_api_key, max_retries=3):
         else:
             logs = get_container_logs(container_name)
             print(f"[Test] ❌ App not responding. Logs:\n{logs}")
+            error_log.append(f"Attempt {attempt} (no response): container started but port never opened. Logs: {logs}")
             if attempt < max_retries:
                 fix_dockerfile_with_llm(dockerfile_path, error_output=logs,
                                         error_type="no_response", context=context, openai_api_key=openai_api_key)
@@ -1540,9 +1574,73 @@ def test_docker_image(folder, app_name, context, openai_api_key, max_retries=3):
                 continue
             else:
                 cleanup_test_container(container_name, image_tag)
-                return False
+                break
 
-    return False
+    # ── Nuclear round — all retries exhausted ─────────────────────────────
+    print(f"\n[Test] ☢️  All {max_retries} patch attempts failed — nuclear regeneration")
+    notes_path = os.path.join(folder, "_agent_notes.txt")
+    nuclear_context = "PREVIOUS DOCKERFILE ATTEMPTS ALL FAILED — DO NOT REPEAT THESE MISTAKES:\n\n"
+    for entry in error_log:
+        nuclear_context += f"- {entry}\n"
+    with open(notes_path, "w", encoding="utf-8") as f:
+        f.write(nuclear_context)
+
+    print(f"[Test] 🔄 Regenerating Dockerfile from scratch with full error history...")
+    try:
+        generate_dockerfile_with_openai(folder, openai_api_key)
+    finally:
+        if os.path.exists(notes_path):
+            os.remove(notes_path)
+
+    print(f"[Test] ── Nuclear build ──────────────────────────────────────")
+    nuclear_build = subprocess.run(
+        ["docker", "build", "-t", image_tag, "."],
+        cwd=folder, capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
+    )
+    if nuclear_build.returncode != 0:
+        print(f"[Test] ❌ Nuclear build failed:\n{nuclear_build.stderr[-2000:]}")
+        return False
+
+    print(f"[Test] ✅ Nuclear build succeeded")
+    test_port = _find_free_port(detect_port_from_dockerfile(folder))
+    if test_port is None:
+        cleanup_test_container(container_name, image_tag)
+        return True
+
+    subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
+    nuclear_run = subprocess.run(
+        ["docker", "run", "-d", "--name", container_name,
+         "-p", f"{test_port}:{test_port}", "-e", f"PORT={test_port}", image_tag],
+        capture_output=True, text=True,
+    )
+    if nuclear_run.returncode != 0:
+        print(f"[Test] ❌ Nuclear container failed to start")
+        cleanup_test_container(container_name, image_tag)
+        return False
+
+    startup_wait = get_startup_wait(ml_type, framework)
+    print(f"[Test] Waiting {startup_wait}s for app to start...")
+    time.sleep(startup_wait)
+
+    import urllib.request
+    health_ok = False
+    for check_attempt in range(5):
+        try:
+            req = urllib.request.urlopen(f"http://localhost:{test_port}", timeout=10)
+            print(f"[Test] ✅ HTTP {req.getcode()} — nuclear round passed!")
+            health_ok = True
+            break
+        except Exception as e:
+            print(f"[Test] HTTP check {check_attempt+1}/5 failed: {e}")
+            time.sleep(5)
+
+    if health_ok:
+        print(f"\n[Test] ✅✅✅ DOCKER TEST PASSED (nuclear round) ✅✅✅")
+    else:
+        print(f"[Test] ❌ Nuclear round also failed — giving up")
+    cleanup_test_container(container_name, image_tag)
+    return health_ok
 
 
 def _ensure_requirements(folder: str, context: dict, openai_api_key: str):
@@ -2371,6 +2469,62 @@ def run_project_locally(folder, context, openai_api_key=None, max_retries=1):
 
         if any(kw in line for line in lines_snapshot for kw in FATAL_KEYWORDS):
             print(f"[LocalTest] ❌ Fatal error detected — stopping early")
+            with lock:
+                fatal_lines = list(collected_lines)
+            fatal_log = "\n".join(fatal_lines)
+
+            if openai_api_key:
+                # ── Extract failing file from traceback ───────────────
+                import re
+                file_match = re.search(r'File "([^"]+\.py)", line (\d+)', fatal_log)
+                if file_match:
+                    failing_file = file_match.group(1)
+                    failing_line = file_match.group(2)
+                    if os.path.isfile(failing_file):
+                        print(f"[LocalTest] 🔧 Asking GPT-4o to fix: {os.path.basename(failing_file)} line {failing_line}")
+                        try:
+                            with open(failing_file, "r", encoding="utf-8", errors="ignore") as _f:
+                                file_src = _f.read()
+                            from openai import OpenAI
+                            client = OpenAI(api_key=openai_api_key)
+                            resp = client.chat.completions.create(
+                                model="gpt-4o",
+                                messages=[
+                                    {"role": "system", "content": "You are a Python expert. Fix the bug in the file. Return ONLY the complete fixed file content, no markdown, no backticks."},
+                                    {"role": "user", "content": f"ERROR:\n{fatal_log[-2000:]}\n\nFILE ({failing_file}):\n{file_src}"}
+                                ],
+                                temperature=0.1,
+                            )
+                            fixed_src = resp.choices[0].message.content.strip()
+                            if fixed_src.startswith("```"):
+                                fixed_src = "\n".join(
+                                    l for l in fixed_src.splitlines()
+                                    if not l.strip().startswith("```")
+                                ).strip()
+                            with open(failing_file, "w", encoding="utf-8") as _f:
+                                _f.write(fixed_src)
+                            print(f"[LocalTest] ✅ File fixed — restarting server...")
+                            try:
+                                proc.kill()
+                                proc.wait(timeout=5)
+                            except Exception:
+                                pass
+                            # Restart server with fixed file
+                            collected_lines.clear()
+                            proc = subprocess.Popen(
+                                cmd, cwd=folder,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                text=True,
+                            )
+                            t_out = threading.Thread(target=stream_reader, args=(proc.stdout, "OUT"), daemon=True)
+                            t_err = threading.Thread(target=stream_reader, args=(proc.stderr, "ERR"), daemon=True)
+                            t_out.start()
+                            t_err.start()
+                            start_time = time.time()
+                            continue
+                        except Exception as fix_err:
+                            print(f"[LocalTest] ⚠️  Auto-fix failed: {fix_err}")
             break
 
         if proc.poll() is not None:
@@ -2448,7 +2602,93 @@ def _cleanup_venv(venv_dir):
 # GIT OPERATIONS
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _handle_large_files(folder):
+    """Detect files >100 MB in the last commit and handle them via LFS or .gitignore."""
+    LIMIT = 100 * 1024 * 1024  # 100 MB
+
+    # Check files in the last commit (already committed, not just staged)
+    result = subprocess.run(
+        ["git", "diff", "--name-only", "HEAD~1", "HEAD"],
+        cwd=folder, capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        # Fallback: first commit — list all files tracked in HEAD
+        result = subprocess.run(
+            ["git", "ls-tree", "-r", "--name-only", "HEAD"],
+            cwd=folder, capture_output=True, text=True
+        )
+    committed = [f.strip() for f in result.stdout.splitlines() if f.strip()]
+
+    large_files = []
+    for rel_path in committed:
+        abs_path = os.path.join(folder, rel_path)
+        if os.path.isfile(abs_path) and os.path.getsize(abs_path) > LIMIT:
+            large_files.append(rel_path)
+
+    if not large_files:
+        return
+
+    print(f"[Agent] ⚠️  Found {len(large_files)} file(s) exceeding GitHub's 100 MB limit:")
+    for f in large_files:
+        size_mb = os.path.getsize(os.path.join(folder, f)) / (1024 * 1024)
+        print(f"         • {f} ({size_mb:.1f} MB)")
+
+    # Check if git-lfs is available
+    lfs_available = subprocess.run(
+        ["git", "lfs", "version"], capture_output=True
+    ).returncode == 0
+
+    if lfs_available:
+        print("[Agent] 📦 Git LFS available — tracking large files with LFS")
+        subprocess.run(["git", "lfs", "install"], cwd=folder, capture_output=True)
+
+        gitattributes_path = os.path.join(folder, ".gitattributes")
+        existing_patterns = set()
+        if os.path.exists(gitattributes_path):
+            with open(gitattributes_path, "r") as f:
+                for line in f:
+                    existing_patterns.add(line.strip())
+
+        for rel_path in large_files:
+            pattern = f"{rel_path} filter=lfs diff=lfs merge=lfs -text"
+            if pattern not in existing_patterns:
+                subprocess.run(
+                    ["git", "lfs", "track", rel_path],
+                    cwd=folder, capture_output=True
+                )
+                print(f"[Agent] ✅ LFS tracking: {rel_path}")
+            else:
+                print(f"[Agent] ℹ️  {rel_path} already covered by LFS pattern — skipping")
+
+        # Remove large files from the last commit and re-add via LFS, then amend
+        subprocess.run(["git", "add", ".gitattributes"], cwd=folder, capture_output=True)
+        for rel_path in large_files:
+            subprocess.run(["git", "rm", "--cached", rel_path], cwd=folder, capture_output=True)
+            subprocess.run(["git", "add", rel_path], cwd=folder, capture_output=True)
+        subprocess.run(["git", "commit", "--amend", "--no-edit"], cwd=folder, capture_output=True)
+        print("[Agent] ✅ Amended commit — large files now tracked via LFS")
+    else:
+        # No LFS — add large files to .gitignore and amend commit to exclude them
+        print("[Agent] ℹ️  Git LFS not available — adding large files to .gitignore")
+        gitignore_path = os.path.join(folder, ".gitignore")
+        existing = open(gitignore_path).read() if os.path.exists(gitignore_path) else ""
+        with open(gitignore_path, "a") as f:
+            for rel_path in large_files:
+                entry = os.path.basename(rel_path)
+                if entry not in existing:
+                    f.write(f"\n{entry}")
+                    print(f"[Agent] ✅ Added to .gitignore: {entry}")
+
+        for rel_path in large_files:
+            subprocess.run(["git", "rm", "--cached", rel_path], cwd=folder, capture_output=True)
+
+        subprocess.run(["git", "add", ".gitignore"], cwd=folder, capture_output=True)
+        subprocess.run(["git", "commit", "--amend", "--no-edit"], cwd=folder, capture_output=True)
+        print("[Agent] ✅ Amended commit — large files excluded from push")
+
+
 def push_branch(folder, fork_url, token):
+    _handle_large_files(folder)
     auth_url = fork_url.replace("https://", f"https://{token}@")
     subprocess.run(["git", "push", auth_url, "ai-docker-setup", "--force"],
                    cwd=folder, check=True)
@@ -2537,24 +2777,6 @@ def get_pr_details(repo_url, token, pr_number, retries=5, retry_delay=2):
             time.sleep(retry_delay)
 
     return last_payload
-
-
-def _extract_pr_number(pr_url):
-    if not pr_url:
-        return None
-    try:
-        return int(str(pr_url).rstrip("/").split("/")[-1])
-    except (TypeError, ValueError):
-        return None
-
-
-def get_pr_by_number(repo_url, token, pr_number):
-    if not pr_number:
-        return None
-    try:
-        return get_pr_details(repo_url, token, pr_number, retries=1, retry_delay=0)
-    except Exception:
-        return None
 
 
 def check_upstream_merge_conflicts(folder, repo_url, token, default_branch):
@@ -2679,7 +2901,23 @@ def deploy_to_aws(folder, creds):
     access_key = creds["access_key"]
     secret_key = creds["secret_key"]
     env_vars   = creds.get("env_vars", {})
-    port       = detect_port_from_dockerfile(folder, fallback="8080")
+    port       = detect_port_from_dockerfile(folder, fallback="8000")
+
+    # ── Auto-add sslmode for Neon/Supabase DATABASE_URL ──────────
+    if "DATABASE_URL" in env_vars:
+        db_url = env_vars["DATABASE_URL"]
+        if ("neon.tech" in db_url or "supabase" in db_url) and "sslmode" not in db_url:
+            env_vars["DATABASE_URL"] = db_url + ("&" if "?" in db_url else "?") + "sslmode=require"
+            print(f"[AWS] ✅ Auto-added sslmode=require to DATABASE_URL")
+
+    # ── Block localhost DATABASE_URL ──────────────────────────────
+    if "DATABASE_URL" in env_vars:
+        db_url = env_vars["DATABASE_URL"]
+        if "localhost" in db_url or "127.0.0.1" in db_url:
+            raise RuntimeError(
+                "DATABASE_URL points to localhost — won't work on AWS EC2. "
+                "Use a hosted Postgres URL from Neon.tech or Supabase."
+            )
 
     ec2 = boto3.client(
         "ec2",
@@ -2742,7 +2980,11 @@ def deploy_to_aws(folder, creds):
             IpPermissions=[
                 {"IpProtocol": "tcp", "FromPort": int(port), "ToPort": int(port),
                  "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
-                {"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22,
+                {"IpProtocol": "tcp", "FromPort": 80,  "ToPort": 80,
+                 "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
+                {"IpProtocol": "tcp", "FromPort": 443, "ToPort": 443,
+                 "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
+                {"IpProtocol": "tcp", "FromPort": 22,  "ToPort": 22,
                  "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
             ]
         )
@@ -2755,9 +2997,14 @@ def deploy_to_aws(folder, creds):
         else:
             raise
 
-    env_exports = "\n".join(
-        f'export {k}="{v}"' for k, v in env_vars.items()
-    )
+    # ── Build -e flags correctly for docker run ───────────────────
+    # OLD code used `export KEY=value` bash exports which do NOT pass into docker run
+    # NEW code passes env vars directly via -e flags
+    env_flags = f"-e PORT={port}"
+    for k, v in env_vars.items():
+        v_escaped = str(v).replace('"', '\\"').replace('$', '\\$').replace('`', '\\`')
+        env_flags += f' -e "{k}={v_escaped}"'
+
     account_id = boto3.client(
         "sts",
         aws_access_key_id=access_key,
@@ -2765,27 +3012,52 @@ def deploy_to_aws(folder, creds):
     ).get_caller_identity()["Account"]
 
     user_data = f"""#!/bin/bash
+set -e
+exec > /var/log/user-data.log 2>&1
+
+echo "=== Setup started $(date) ==="
+
 yum update -y
-yum install -y docker
+yum install -y docker curl
 service docker start
 usermod -aG docker ec2-user
 
-export AWS_ACCESS_KEY_ID={access_key}
-export AWS_SECRET_ACCESS_KEY={secret_key}
-export AWS_DEFAULT_REGION={region}
+echo "=== Docker installed ==="
 
-aws ecr get-login-password --region {region} | docker login --username AWS --password-stdin {account_id}.dkr.ecr.{region}.amazonaws.com
+# ECR login with inline credentials
+AWS_ACCESS_KEY_ID={access_key} \\
+AWS_SECRET_ACCESS_KEY={secret_key} \\
+AWS_DEFAULT_REGION={region} \\
+aws ecr get-login-password --region {region} | \\
+  docker login --username AWS --password-stdin \\
+  {account_id}.dkr.ecr.{region}.amazonaws.com
 
-{env_exports}
-export PORT={port}
+echo "=== ECR login done ==="
 
 docker pull {image_tag}
+echo "=== Image pulled ==="
+
+# Run container — env vars passed via -e flags, not bash exports
 docker run -d --restart always \\
-  -p {port}:{port} \\
-  -e PORT={port} \\
-  {" ".join(f'-e {k}="{v}"' for k, v in env_vars.items())} \\
   --name {app_name} \\
+  -p {port}:{port} \\
+  {env_flags} \\
   {image_tag}
+
+echo "=== Container started ==="
+
+# Poll until app responds (up to 3 minutes)
+echo "=== Waiting for app on port {port}... ==="
+for i in $(seq 1 36); do
+  if curl -sf http://localhost:{port} > /dev/null 2>&1; then
+    echo "=== App UP after $((i*5))s ==="
+    break
+  fi
+  echo "Attempt $i/36 — not ready yet..."
+  sleep 5
+done
+
+echo "=== Setup complete $(date) ==="
 """
 
     ami_resp = ec2.describe_images(
@@ -2819,17 +3091,26 @@ docker run -d --restart always \\
 
     instance_id = instance_resp["Instances"][0]["InstanceId"]
     print(f"[AWS] ✅ Instance launched: {instance_id}")
-    print(f"[AWS] ⏳ Waiting for instance to get public IP (30s)...")
-    time.sleep(30)
 
-    desc      = ec2.describe_instances(InstanceIds=[instance_id])
-    public_ip = desc["Reservations"][0]["Instances"][0].get("PublicIpAddress", "")
+    # ── Poll for public IP (up to 60s) ────────────────────────────
+    print(f"[AWS] ⏳ Waiting for public IP...")
+    public_ip = ""
+    for _ in range(12):
+        time.sleep(5)
+        desc      = ec2.describe_instances(InstanceIds=[instance_id])
+        public_ip = desc["Reservations"][0]["Instances"][0].get("PublicIpAddress", "")
+        if public_ip:
+            break
 
     if public_ip:
         url = f"http://{public_ip}:{port}"
-        print(f"[AWS] ✅ Instance running at: {url}")
-        print(f"[AWS] ⏳ App may take 5-7 minutes to start (install Docker + pull image + run)")
-        print(f"[AWS] ℹ️  Instance ID: {instance_id} — stop it from AWS console to avoid charges")
+        print(f"[AWS] ✅ Instance IP: {public_ip}")
+        print(f"[AWS] 🌐 App URL: {url}")
+        print(f"[AWS] ⏳ App ready in ~5-7 minutes (EC2 boots → installs Docker → pulls image → starts)")
+        print(f"[AWS] 🔍 SSH debug:      ssh ec2-user@{public_ip}")
+        print(f"[AWS] 🔍 Setup logs:     cat /var/log/user-data.log")
+        print(f"[AWS] 🔍 Container logs: docker logs {app_name}")
+        print(f"[AWS] ℹ️  Instance ID: {instance_id} — stop from AWS console to avoid charges")
         return url
     else:
         url = f"http://check-aws-console-for-ip:{port}"
@@ -2863,6 +3144,12 @@ def deploy_to_azure(folder, creds):
     image_tag    = f"{login_server}/{app_name}:latest"
 
     env_vars = creds.get("env_vars", {})
+    # ── Auto-add sslmode for Postgres URLs that need it ───────────
+    if env_vars and "DATABASE_URL" in env_vars:
+        db_url = env_vars["DATABASE_URL"]
+        if ("neon.tech" in db_url or "supabase" in db_url) and "sslmode" not in db_url:
+            env_vars["DATABASE_URL"] = db_url + ("&" if "?" in db_url else "?") + "sslmode=require"
+            print(f"[Railway] ✅ Auto-added sslmode=require to DATABASE_URL")
     env_list = [{"name": k, "value": v} for k, v in env_vars.items()]
 
     aca = ContainerAppsAPIClient(cred, creds["subscription_id"])
@@ -3445,8 +3732,12 @@ def node_pause_for_user(state: AgentState) -> AgentState:
     print(f"{'='*55}\n")
 
     try:
-        subprocess.Popen(["code", folder_path])
-        print(f"[Agent] ✅ VS Code opened at: {folder_path}")
+        
+        if _tool_ok("code"):
+            subprocess.Popen(["code", folder_path])
+            print(f"[Agent] ✅ VS Code opened at: {folder_path}")
+        else:
+            print(f"[Agent] ⚠️  VS Code not found. Open manually: {folder_path}")
     except FileNotFoundError:
         print(f"[Agent] ⚠️  VS Code not found — open manually: code {folder_path}")
 
@@ -3796,7 +4087,35 @@ Return ONLY this JSON:
                     print(f"[Agent] ✅ Continuing with manually resolved conflicts")
 
 
-        dockerfile_content, context = generate_dockerfile_with_openai(folder, openai_api_key)
+        # ── Capture user's local Dockerfile before AI overwrites it ──
+        dockerfile_path = os.path.join(folder, "Dockerfile")
+        user_dockerfile = None
+        if os.path.exists(dockerfile_path):
+            with open(dockerfile_path, "r", encoding="utf-8", errors="ignore") as _f:
+                user_dockerfile = _f.read()
+
+        # ── Check what Dockerfile looks like on upstream/main ─────────
+        upstream_dockerfile_result = subprocess.run(
+            ["git", "show", f"upstream/{default_branch}:Dockerfile"],
+            cwd=folder, capture_output=True, text=True
+        )
+        upstream_dockerfile = upstream_dockerfile_result.stdout if upstream_dockerfile_result.returncode == 0 else None
+
+        # ── If user changed Dockerfile vs upstream, preserve their version
+        user_has_dockerfile_changes = (
+            user_dockerfile is not None
+            and upstream_dockerfile is not None
+            and user_dockerfile.strip() != upstream_dockerfile.strip()
+        )
+
+        if user_has_dockerfile_changes:
+            print("[Agent] 🔍 Local Dockerfile changes detected — using your version instead of regenerating")
+            dockerfile_content, context = generate_dockerfile_with_openai(folder, openai_api_key)
+            # Restore user's version on top of AI-generated one
+            with open(dockerfile_path, "w", encoding="utf-8") as _f:
+                _f.write(user_dockerfile)
+        else:
+            dockerfile_content, context = generate_dockerfile_with_openai(folder, openai_api_key)
 
         gitignore_path = os.path.join(folder, ".gitignore")
         if os.path.exists(gitignore_path):
@@ -3836,6 +4155,8 @@ Return ONLY this JSON:
             if f not in ("Dockerfile", "docker-compose.yml", ".gitignore")
         )
         commit_msg = (
+            "Updated Dockerfile with user changes"
+            if user_has_dockerfile_changes else
             "AI generated Dockerfile + user changes"
             if has_user_changes else
             "AI generated Dockerfile via OpenAI"
@@ -3849,7 +4170,13 @@ Return ONLY this JSON:
         if result.returncode != 0:
             combined = (result.stdout + result.stderr).lower()
             if "nothing to commit" in combined or "nothing added to commit" in combined:
-                print("[Agent] ℹ️  Dockerfile already up to date — skipping commit")
+                if user_has_dockerfile_changes:
+                    # Force a commit even if git thinks nothing changed
+                    subprocess.run(["git", "commit", "--allow-empty", "-m", commit_msg],
+                                   cwd=folder, check=True)
+                    print("[Agent] ✅ Committed user Dockerfile changes (forced)")
+                else:
+                    print("[Agent] ℹ️  Dockerfile already up to date — skipping commit")
             else:
                 raise RuntimeError(f"Commit failed: {result.stderr.strip()}")
         else:
@@ -3885,13 +4212,12 @@ def node_hitl_pr_approval(state: AgentState) -> AgentState:
     return {**state, "pr_approved": True, "current_step": "hitl_pr_approval"}
 
 
-def poll_pr_status(repo_url, token, fork_owner, pr_url=None, poll_interval=30, timeout_minutes=30):
+def poll_pr_status(repo_url, token, fork_owner, poll_interval=30, timeout_minutes=30):
     repo      = repo_url.replace("https://github.com/", "").rstrip("/")
     headers   = make_github_headers(token)
     check_url = f"https://api.github.com/repos/{repo}/pulls"
     deadline  = time.time() + timeout_minutes * 60
     last_reported_state = None
-    pr_number = _extract_pr_number(pr_url)
 
     repo_owner = repo.split("/")[0]
     head_param = "ai-docker-setup" if fork_owner == repo_owner else f"{fork_owner}:ai-docker-setup"
@@ -3900,46 +4226,6 @@ def poll_pr_status(repo_url, token, fork_owner, pr_url=None, poll_interval=30, t
 
     while time.time() < deadline:
         try:
-            if pr_number:
-                pr = get_pr_by_number(repo_url, token, pr_number)
-                if pr:
-                    if pr.get("merged_at"):
-                        print(f"[Agent] ✅ PR MERGED: {pr['html_url']}")
-                        return "merged"
-                    if pr.get("state") == "closed":
-                        print(f"[Agent] ❌ PR CLOSED/REJECTED: {pr['html_url']}")
-                        return "closed"
-
-                    mergeable = pr.get("mergeable")
-                    mergeable_state = pr.get("mergeable_state", "unknown")
-
-                    if mergeable is None:
-                        current_state = "computing"
-                        if last_reported_state != current_state:
-                            print(f"[Agent] ⏳ GitHub is still computing mergeability for: {pr['html_url']}")
-                        last_reported_state = current_state
-                    elif mergeable is False or mergeable_state in {"dirty", "blocked", "behind", "unstable"}:
-                        current_state = "conflict"
-                        if last_reported_state != current_state:
-                            print(f"\n[Agent] ⚠️  PR HAS MERGE ISSUES on GitHub!")
-                            print(f"[Agent] 🔗 PR URL: {pr['html_url']}")
-                            print(f"[Agent] ℹ️  mergeable={mergeable} | mergeable_state={mergeable_state}")
-                            print(f"[Agent] ℹ️  GitHub cannot auto-merge yet.")
-                            print(f"\n[Agent] Options:")
-                            print(f"  1. Go to GitHub PR and resolve conflicts/update the branch")
-                            print(f"  2. Or fix locally and force push to ai-docker-setup branch")
-                            print()
-                            print(f"[Agent] ⏳ Waiting for the PR to become mergeable...")
-                        last_reported_state = current_state
-                    else:
-                        current_state = "open_clean"
-                        if last_reported_state != current_state:
-                            print(f"[Agent] ⏳ PR still open and mergeable: {pr['html_url']}")
-                        last_reported_state = current_state
-
-                    time.sleep(poll_interval)
-                    continue
-
             r = requests.get(check_url, headers=headers,
                              params={"head": head_param, "state": "open"})
             open_prs = r.json() if r.status_code == 200 else []
@@ -4213,7 +4499,10 @@ Return ONLY this JSON:
             else:
                 # User rejected — open VS Code for manual resolution
                 print(f"[Agent] 👨‍💻 Opening VS Code for manual conflict resolution...")
-                subprocess.Popen(["code", os.path.abspath(state["folder"])])
+                if _tool_ok("code"):
+                    subprocess.Popen(["code", os.path.abspath(state["folder"])])
+                else:
+                    print(f"[Agent] ⚠️  VS Code not found. Open manually: {os.path.abspath(state['folder'])}")
                 print(f"\n[Agent] ℹ️  In VS Code:")
                 print(f"           • Look for files with <<<<<<< markers")
                 print(f"           • Delete the version you don't want")
@@ -4229,7 +4518,14 @@ Return ONLY this JSON:
             cwd=state["folder"], capture_output=True, text=True
         )
 
-        if not result.stdout.strip():
+        # Also check if Dockerfile content actually differs from upstream/main
+        df_diff = subprocess.run(
+            ["git", "diff", f"upstream/{state['default_branch']}", "--", "Dockerfile"],
+            cwd=state["folder"], capture_output=True, text=True
+        )
+        dockerfile_differs = bool(df_diff.stdout.strip())
+
+        if not result.stdout.strip() and not dockerfile_differs:
             print("[Agent] ℹ️  No commits between main and ai-docker-setup — Dockerfile already on main, skipping PR.")
 
             old_folder = state["folder"]
@@ -4238,11 +4534,13 @@ Return ONLY this JSON:
 
             auth_url     = state["repo_url"].replace("https://", f"https://{state['token']}@")
             repo_name    = state["repo_url"].rstrip("/").split("/")[-1].replace(".git", "")
+            _ws = os.path.join(os.path.expanduser("~"), "ai-devops-workspace")
+            os.makedirs(_ws, exist_ok=True)
+            fresh_folder = os.path.join(_ws, repo_name)
             subprocess.run(
-                ["git", "clone", "--branch", state["default_branch"], "--single-branch", auth_url, repo_name],
+                ["git", "clone", "--branch", state["default_branch"], "--single-branch", auth_url, fresh_folder],
                 check=True
             )
-            fresh_folder = repo_name
             print(f"[Agent] ✅ Fresh clone ready: {fresh_folder}")
 
             test_folder = f"{repo_name}_test"
@@ -4280,7 +4578,6 @@ Return ONLY this JSON:
         status = poll_pr_status(
             state["repo_url"], state["token"],
             state["fork_owner"],
-            pr_url=pr_url,
             poll_interval=30,
             timeout_minutes=30,
         )
@@ -4294,11 +4591,13 @@ Return ONLY this JSON:
 
             auth_url     = state["repo_url"].replace("https://", f"https://{state['token']}@")
             repo_name    = state["repo_url"].rstrip("/").split("/")[-1].replace(".git", "")
+            _ws = os.path.join(os.path.expanduser("~"), "ai-devops-workspace")
+            os.makedirs(_ws, exist_ok=True)
+            fresh_folder = os.path.join(_ws, repo_name)
             subprocess.run(
-                ["git", "clone", "--branch", state["default_branch"], "--single-branch", auth_url, repo_name],
+                ["git", "clone", "--branch", state["default_branch"], "--single-branch", auth_url, fresh_folder],
                 check=True
             )
-            fresh_folder = repo_name
             print(f"[Agent] ✅ Fresh clone ready: {fresh_folder}")
 
             test_folder = f"{repo_name}_test"

@@ -1,0 +1,1640 @@
+import streamlit as st
+import os
+import subprocess
+import json
+import shutil
+import builtins
+import time
+import threading
+import sys
+import requests
+
+import langgraph_4 as agent
+import shutil as _shutil
+
+def _check_tool(name):
+    return _shutil.which(name) is not None
+
+TOOLS = {
+    "git":    _check_tool("git"),
+    "docker": _check_tool("docker"),
+    "code":   _check_tool("code"),
+}
+
+WORKSPACE = os.path.join(os.path.expanduser("~"), "ai-devops-workspace")
+os.makedirs(WORKSPACE, exist_ok=True)
+
+st.set_page_config(layout="wide")
+
+# ── Monkeypatch builtins.input so agent functions never block ──
+_orig_input = builtins.input
+
+def _patch_input():
+    builtins.input = lambda *_: "y"
+
+def _restore_input():
+    builtins.input = _orig_input
+
+# ── Session state defaults ──
+for k, v in {
+    "stage": "idle",
+    "saved_repo_url": "",
+    "folder": None,
+    "fork_url": None,
+    "default_branch": None,
+    "user": None,
+    "context": None,
+    "pr_url": None,
+    "deploy_results": {},
+    "logs": [],
+    "stash_conflict": None,
+    "merge_conflict": None,
+    "test_proc": None,
+    "test_folder": None,
+    "test_port": None,
+    "test_venv": None,
+    "test_ctx": None,
+    "user_dockerfile": None,
+    "user_has_dockerfile_changes": False,
+}.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+# ── Sidebar ──
+st.sidebar.title("Configuration")
+openai_key = st.sidebar.text_input("OpenAI API Key", type="password")
+token      = st.sidebar.text_input("GitHub Token",   type="password")
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("**System Tools**")
+for _tool, _ok in TOOLS.items():
+    if _ok:
+        st.sidebar.success(f"✅ {_tool} found")
+    else:
+        st.sidebar.error(f"❌ {_tool} not in PATH — install it or add to PATH")
+
+if st.session_state.logs:
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("**Activity Log**")
+    st.sidebar.code("\n".join(st.session_state.logs[-30:]))
+
+def log(msg):
+    st.session_state.logs.append(msg)
+
+def _open_vscode(path):
+    """Open VS Code if available, otherwise show path to user."""
+    if TOOLS["code"]:
+        try:
+            subprocess.Popen(["code", os.path.abspath(path)])
+        except Exception as e:
+            st.info(f"Could not open VS Code: {e}\nOpen manually: `{os.path.abspath(path)}`")
+    else:
+        st.info(f"VS Code not found. Open this folder manually:\n`{os.path.abspath(path)}`")
+
+def _git_clone(auth_url, branch, clone_dest):
+    """Clone a repo with clear error messages if git is missing."""
+    if not TOOLS["git"]:
+        st.error("git not found on this machine. Install Git and ensure it is in your PATH.")
+        st.stop()
+    try:
+        subprocess.run(
+            ["git", "clone", "--branch", branch, "--single-branch", auth_url, clone_dest],
+            check=True
+        )
+    except subprocess.CalledProcessError as e:
+        st.error(f"git clone failed: {e}")
+        st.stop()
+
+# ── Stage progress indicator ──
+STAGE_LABELS = {
+    "idle":             "Step 1 / 8 — Clone Repo",
+    "cloned":           "Step 2 / 8 — Edit Files & Setup",
+    "docker":           "Step 3 / 8 — Generate Dockerfile",
+    "stash_conflict":   "Step 3 / 8 — Resolve Stash Conflict",
+    "stash_manual":     "Step 3 / 8 — Manual Stash Resolution",
+    "docker_done":      "Step 4 / 8 — Docker Test",
+    "push":             "Step 5 / 8 — Push & Create PR",
+    "merge_conflict":   "Step 5 / 8 — Resolve Merge Conflict",
+    "merge_manual":     "Step 5 / 8 — Manual Merge Resolution",
+    "pr_created":       "Step 6 / 8 — Wait for PR Merge",
+    "fresh_cloned":     "Step 6b / 8 — Review & .env Setup",
+    "local_testing":    "Step 6c / 8 — Local Test",
+    "server_running":   "Step 6c / 8 — Server Running (Review & Approve)",
+    "deploy_approval":  "Step 7 / 8 — Deploy?",
+    "local_done":       "Step 8 / 8 — Deploy",
+    "deployed":         "Done — Deployment Complete",
+    "done_no_deploy":   "Done — Deployment Skipped",
+}
+
+st.title("AI DevOps Agent")
+st.caption(f"Stage: **{STAGE_LABELS.get(st.session_state.stage, st.session_state.stage)}**")
+st.divider()
+
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 1 — CLONE
+# ══════════════════════════════════════════════════════════════════
+if st.session_state.stage == "idle":
+    repo_url = st.text_input("GitHub Repo URL")
+
+    if st.button("Clone Repo"):
+        if not repo_url.strip():
+            st.error("Enter a GitHub repo URL first.")
+            st.stop()
+        if not TOOLS["git"]:
+            st.error("git not found in PATH. Install Git before continuing.")
+            st.stop()
+        try:
+            with st.spinner("Authenticating..."):
+                user = agent.get_authenticated_user(token)
+                st.session_state.user = user
+                log(f"Authenticated as: {user}")
+
+            with st.spinner("Getting default branch..."):
+                branch = agent.get_default_branch(repo_url, token)
+                st.session_state.default_branch = branch
+                log(f"Default branch: {branch}")
+
+            with st.spinner("Forking repo..."):
+                fork_url = agent.fork_repo(repo_url, token)
+                st.session_state.fork_url = fork_url
+                log(f"Fork ready: {fork_url}")
+
+            with st.spinner("Cloning..."):
+                folder = agent.download_repo(repo_url, fork_url, branch)
+                st.session_state.folder = folder
+                st.session_state.saved_repo_url = repo_url
+                log(f"Cloned to: {folder}")
+
+            st.session_state.stage = "cloned"
+            _open_vscode(folder)
+            st.rerun()
+
+        except Exception as e:
+            st.error(str(e))
+
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 2 — PAUSE: EDIT + ENV VARS + NOTES
+# ══════════════════════════════════════════════════════════════════
+if st.session_state.stage == "cloned":
+    folder   = st.session_state.folder
+    repo_url = st.session_state.saved_repo_url
+
+    st.subheader("Edit Files")
+    all_files = sorted([
+        f for f in os.listdir(folder)
+        if not f.startswith(".") and f not in ("__pycache__", "_test_venv")
+    ])
+    sel_file = st.selectbox("Select file to edit", all_files)
+    sel_path = os.path.join(folder, sel_file)
+    if os.path.isfile(sel_path):
+        with open(sel_path, "r", errors="ignore") as fh:
+            current_content = fh.read()
+        edited = st.text_area("Content", current_content, height=300, key="file_editor")
+        if st.button("Save File"):
+            with open(sel_path, "w") as fh:
+                fh.write(edited)
+            st.success("Saved")
+
+    st.divider()
+
+    st.markdown("**Agent Notes** *(hints for Dockerfile generation — e.g. 'entry is src/main.py', 'use port 8080')*")
+    notes_path     = os.path.join(folder, "_agent_notes.txt")
+    existing_notes = open(notes_path).read() if os.path.exists(notes_path) else ""
+    notes_input    = st.text_area("Notes", existing_notes, height=80, key="notes_area")
+
+    st.divider()
+
+    st.markdown("**Environment Variables**")
+    env_file = os.path.join(folder, ".env")
+    if os.path.exists(env_file):
+        st.info("Found existing .env — edit below or leave as-is.")
+        existing_env = open(env_file).read()
+    else:
+        existing_env = ""
+
+    needed_vars = agent._detect_env_var_needs(folder)
+    if needed_vars:
+        st.caption(f"Likely needed: {', '.join(needed_vars)}")
+
+    env_text = st.text_area("KEY=VALUE (one per line)", existing_env, key="env_area")
+
+    st.divider()
+
+    req_missing = not any(
+        os.path.exists(os.path.join(folder, f))
+        for f in ["requirements.txt", "package.json", "go.mod", "Gemfile",
+                  "Cargo.toml", "composer.json", "pom.xml", "Pipfile"]
+    )
+    auto_gen_reqs = False
+    if req_missing:
+        auto_gen_reqs = st.checkbox("Auto-generate missing requirements file", value=True)
+
+    if st.button("Done Editing — Generate Dockerfile"):
+        if notes_input.strip():
+            with open(notes_path, "w") as fh:
+                fh.write(notes_input.strip())
+            log("Saved _agent_notes.txt")
+
+        env_vars = {}
+
+# 🔥 Step 1: Load from .env file (already saved earlier)
+        if os.path.exists(env_file):
+            for line in open(env_file):
+                line = line.strip()
+                if "=" in line and not line.startswith("#"):
+                    k, _, v = line.partition("=")
+                    env_vars[k.strip()] = v.strip()
+
+        # 🔥 Step 2: Override with UI input (if user edited anything)
+        for line in env_text.strip().splitlines():
+            line = line.strip()
+            if "=" in line and not line.startswith("#"):
+                k, _, v = line.partition("=")
+                env_vars[k.strip()] = v.strip()
+        if env_vars:
+            with open(env_file, "w") as fh:
+                for k, v in env_vars.items():
+                    fh.write(f"{k}={v}\n")
+            gitignore = os.path.join(folder, ".gitignore")
+            if os.path.exists(gitignore):
+                gi = open(gitignore).read()
+                if ".env" not in gi:
+                    open(gitignore, "a").write("\n.env\n")
+            else:
+                open(gitignore, "w").write(".env\n")
+            log(f"Saved {len(env_vars)} env vars to .env")
+
+        st.session_state.auto_gen_reqs = auto_gen_reqs
+        st.session_state.stage = "docker"
+        st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 3 — CREATE BRANCH + GENERATE DOCKERFILE
+# ══════════════════════════════════════════════════════════════════
+if st.session_state.stage == "docker":
+    folder         = st.session_state.folder
+    fork_url       = st.session_state.fork_url
+    repo_url       = st.session_state.saved_repo_url
+    default_branch = st.session_state.default_branch
+
+    st.subheader("Generating Dockerfile")
+    st.info("Setting up branch and generating Dockerfile — this may take a minute.")
+
+    if st.button("Generate Dockerfile"):
+        conflict_hit = False
+
+        with st.spinner("Creating ai-docker-setup branch..."):
+            try:
+                status = subprocess.run(
+                    ["git", "status", "--porcelain"],
+                    cwd=folder, capture_output=True, text=True, check=True
+                )
+                has_changes = bool(status.stdout.strip())
+
+                subprocess.run(["git", "remote", "set-url", "origin",   fork_url], cwd=folder, check=True)
+                subprocess.run(["git", "remote", "set-url", "upstream", repo_url], cwd=folder, check=True)
+
+                if has_changes:
+                    log("Stashing local changes...")
+                    subprocess.run(
+                        ["git", "stash", "push", "-u", "-m", f"agent-stash-{int(time.time())}"],
+                        cwd=folder, check=True
+                    )
+
+                subprocess.run(["git", "fetch", "upstream", default_branch], cwd=folder, check=True)
+                subprocess.run(
+                    ["git", "checkout", "-B", default_branch, f"upstream/{default_branch}"],
+                    cwd=folder, check=True
+                )
+                subprocess.run(["git", "checkout", "-B", "ai-docker-setup"], cwd=folder, check=True)
+                log("Checked out ai-docker-setup branch")
+
+                if has_changes:
+                    pop = subprocess.run(
+                        ["git", "stash", "pop"], cwd=folder, capture_output=True, text=True
+                    )
+                    if pop.returncode == 0:
+                        _df_path = os.path.join(folder, "Dockerfile")
+                        _upstream_df = subprocess.run(
+                            ["git", "show", f"upstream/{default_branch}:Dockerfile"],
+                            cwd=folder, capture_output=True, text=True
+                        )
+                        _user_df = open(_df_path, "r", errors="ignore").read() if os.path.exists(_df_path) else None
+                        _upstream_df_content = _upstream_df.stdout if _upstream_df.returncode == 0 else None
+                        st.session_state["user_dockerfile"] = _user_df
+                        st.session_state["user_has_dockerfile_changes"] = (
+                            _user_df is not None
+                            and _upstream_df_content is not None
+                            and _user_df.strip() != _upstream_df_content.strip()
+                        )
+                        if st.session_state["user_has_dockerfile_changes"]:
+                            log("Local Dockerfile changes detected — will preserve after AI generation")
+                    if pop.returncode != 0:
+                        log("Stash conflict — asking GPT-4o...")
+
+                        conflict_files_raw = subprocess.run(
+                            ["git", "diff", "--name-only", "--diff-filter=U"],
+                            cwd=folder, capture_output=True, text=True
+                        )
+                        conflict_files = [
+                            f.strip() for f in conflict_files_raw.stdout.splitlines() if f.strip()
+                        ]
+
+                        file_contents = {}
+                        for fn in conflict_files:
+                            fp = os.path.join(folder, fn)
+                            try:
+                                file_contents[fn] = open(fp, "r", errors="ignore").read(3000)
+                            except Exception:
+                                file_contents[fn] = "(unreadable)"
+
+                        ctx_text  = "\n\n".join(f"--- {fn} ---\n{c}" for fn, c in file_contents.items())
+                        stash_out = pop.stdout + pop.stderr
+
+                        from openai import OpenAI
+                        client = OpenAI(api_key=openai_key)
+
+                        r1 = client.chat.completions.create(
+                            model="gpt-4o",
+                            messages=[
+                                {"role": "system", "content": "You are a Git expert. Be concise."},
+                                {"role": "user", "content": f"""
+Stash pop conflict when re-applying local changes on top of upstream '{default_branch}'.
+
+CONFLICTING FILES:
+{ctx_text}
+
+STASH OUTPUT:
+{stash_out}
+
+1. Explain the conflict in simple terms
+2. Recommend: OURS (local changes) or THEIRS (upstream) and WHY
+"""}
+                            ], temperature=0.1
+                        )
+                        analysis = r1.choices[0].message.content.strip()
+
+                        r2 = client.chat.completions.create(
+                            model="gpt-4o",
+                            messages=[
+                                {"role": "system", "content": "Return ONLY valid JSON, nothing else."},
+                                {"role": "user", "content": f"""
+Conflict:\n{stash_out}\n\nFiles:\n{ctx_text[:1500]}
+
+Return ONLY:
+{{"strategy":"ours or theirs","reason":"one sentence","files":[{{"file":"name","action":"ours or theirs","reason":"why"}}]}}
+"""}
+                            ], temperature=0
+                        )
+                        raw = r2.choices[0].message.content.strip()
+                        if raw.startswith("```"):
+                            raw = "\n".join(
+                                l for l in raw.splitlines() if not l.strip().startswith("```")
+                            ).strip()
+                        try:
+                            strategy = json.loads(raw)
+                        except Exception:
+                            strategy = {"strategy": "ours", "reason": "Parse error — defaulting to ours", "files": []}
+
+                        st.session_state.stash_conflict = {
+                            "files":    conflict_files,
+                            "analysis": analysis,
+                            "strategy": strategy,
+                        }
+                        st.session_state.stage = "stash_conflict"
+                        conflict_hit = True
+                        st.rerun()
+
+            except Exception as e:
+                st.error(f"Branch setup failed: {e}")
+                st.stop()
+
+        if not conflict_hit:
+            with st.spinner("Ensuring requirements file..."):
+                _patch_input()
+                try:
+                    scan_ctx = agent.deep_scan_repo(folder)
+                    if st.session_state.get("auto_gen_reqs", False):
+                        agent._ensure_requirements(folder, scan_ctx, openai_key)
+                        log("Requirements ensured")
+                finally:
+                    _restore_input()
+
+            with st.spinner("Generating Dockerfile (GPT-4o)..."):
+                _patch_input()
+                try:
+                    dockerfile, context = agent.generate_dockerfile_with_openai(folder, openai_key)
+                    st.session_state.context = context
+                    log("Dockerfile generated")
+                    if st.session_state.get("user_has_dockerfile_changes") and st.session_state.get("user_dockerfile"):
+                        _df_path = os.path.join(folder, "Dockerfile")
+                        with open(_df_path, "w", encoding="utf-8") as _f:
+                            _f.write(st.session_state["user_dockerfile"])
+                        log("Restored user's local Dockerfile changes on top of AI generation")
+                except Exception as e:
+                    st.error(f"Dockerfile generation failed: {e}")
+                    st.stop()
+                finally:
+                    _restore_input()
+
+            st.session_state.stage = "docker_done"
+            st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 3b — STASH CONFLICT
+# ══════════════════════════════════════════════════════════════════
+if st.session_state.stage == "stash_conflict":
+    folder = st.session_state.folder
+    data   = st.session_state.stash_conflict
+
+    st.subheader("Stash Conflict Detected")
+    st.warning(f"Conflicting files: `{'`, `'.join(data['files'])}`")
+
+    with st.expander("GPT-4o Analysis", expanded=True):
+        st.markdown(data["analysis"])
+
+    strategy = data["strategy"]
+    st.markdown(f"**Recommended strategy:** `{strategy.get('strategy','ours').upper()}` — {strategy.get('reason','')}")
+    for f_item in strategy.get("files", []):
+        st.write(f"  • `{f_item.get('file')}` → keep **{f_item.get('action','ours').upper()}** — {f_item.get('reason','')}")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        if st.button("Accept LLM Resolution"):
+            overall  = strategy.get("strategy", "ours")
+            file_map = {fi.get("file"): fi.get("action", overall) for fi in strategy.get("files", [])}
+            for fn in data["files"]:
+                side = "--ours" if file_map.get(fn, overall) == "ours" else "--theirs"
+                subprocess.run(["git", "checkout", side, fn], cwd=folder, capture_output=True)
+                subprocess.run(["git", "add", fn],            cwd=folder, capture_output=True)
+            log(f"Stash conflict resolved ({overall})")
+
+            with st.spinner("Generating Dockerfile..."):
+                _patch_input()
+                try:
+                    scan_ctx = agent.deep_scan_repo(folder)
+                    agent._ensure_requirements(folder, scan_ctx, openai_key)
+                    dockerfile, context = agent.generate_dockerfile_with_openai(folder, openai_key)
+                    st.session_state.context = context
+                    log("Dockerfile generated")
+                finally:
+                    _restore_input()
+
+            st.session_state.stash_conflict = None
+            st.session_state.stage = "docker_done"
+            st.rerun()
+
+    with col2:
+        if st.button("Resolve Manually (VS Code)"):
+            _open_vscode(folder)
+            st.session_state.stage = "stash_manual"
+            st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 3c — MANUAL STASH RESOLUTION
+# ══════════════════════════════════════════════════════════════════
+if st.session_state.stage == "stash_manual":
+    folder = st.session_state.folder
+    st.subheader("Manual Stash Conflict Resolution")
+    st.info(f"Open this folder in your editor: `{os.path.abspath(folder)}`")
+    st.markdown("""
+1. Find files with `<<<<<<<` markers in VS Code
+2. Edit and keep the version you want, remove all conflict markers
+3. Save the files
+4. In your terminal: `git add .`
+5. Click **Done** below
+""")
+    if st.button("Done — Generate Dockerfile"):
+        with st.spinner("Generating Dockerfile..."):
+            _patch_input()
+            try:
+                scan_ctx = agent.deep_scan_repo(folder)
+                agent._ensure_requirements(folder, scan_ctx, openai_key)
+                dockerfile, context = agent.generate_dockerfile_with_openai(folder, openai_key)
+                st.session_state.context = context
+                log("Dockerfile generated after manual resolution")
+            finally:
+                _restore_input()
+
+        st.session_state.stash_conflict = None
+        st.session_state.stage = "docker_done"
+        st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 4 — DOCKER TEST
+# ══════════════════════════════════════════════════════════════════
+if st.session_state.stage == "docker_done":
+    folder  = st.session_state.folder
+    context = st.session_state.context
+
+    st.subheader("Dockerfile")
+    dockerfile_path = os.path.join(folder, "Dockerfile")
+    if os.path.exists(dockerfile_path):
+        with open(dockerfile_path) as fh:
+            st.code(fh.read(), language="dockerfile")
+
+    lang      = context.get("detected_language", "?")
+    framework = context.get("detected_framework", "?")
+    ml_type   = context.get("ml_type", "?")
+    entries   = context.get("entry_points_found", [])
+    st.caption(f"Detected: {lang} / {framework} / ML: {ml_type} | Entry: {entries}")
+
+    if not TOOLS["docker"]:
+        st.error("Docker not found in PATH. Install Docker Desktop and ensure it is running before running this step.")
+    elif st.button("Run Docker Test"):
+        app_name = os.path.basename(folder).lower().replace("_", "-")
+        with st.spinner("Building & testing Docker image (up to 3 retries with auto-fix + nuclear regeneration if all fail)..."):
+            try:
+                _patch_input()
+                try:
+                    passed = agent.test_docker_image(folder, app_name, context, openai_key, max_retries=3)
+                finally:
+                    _restore_input()
+
+                if passed:
+                    log("Docker test passed")
+                    st.success("Docker test passed")
+                    st.session_state.stage = "push"
+                    st.rerun()
+                else:
+                    st.error("Docker test failed after 3 retries + nuclear regeneration")
+                    log("Docker test failed (including nuclear round)")
+            except Exception as e:
+                st.error(str(e))
+
+# ══════════════════════════════════════════════════════════════════
+# EXPLAIN MODE  — paste this block right after your docker_done stage
+# (after the "Run Docker Test" button section, before STEP 5)
+# ══════════════════════════════════════════════════════════════════
+
+if st.session_state.stage == "docker_done" and st.session_state.context:
+
+    st.divider()
+    st.markdown("#### 🤖 Explain Mode")
+
+    if st.button("Explain what happened", key="explain_btn"):
+
+        context        = st.session_state.context
+        folder         = st.session_state.folder
+        openai_api_key = openai_key          # already defined in your sidebar
+
+        # ── 1. Gather facts from context ──────────────────────────
+        lang       = context.get("detected_language",  "unknown")
+        framework  = context.get("detected_framework", "unknown")
+        ml_type    = context.get("ml_type",            "unknown")
+        ml_libs    = context.get("ml_frameworks",      [])
+        entries    = context.get("entry_points_found", [])
+        py_ver     = context.get("python_version",     "3.11")
+        node_ver   = context.get("node_version",       "18")
+        uses_gpu   = context.get("uses_gpu",           False)
+        uses_conda = context.get("uses_conda",         False)
+        is_ml      = context.get("is_ml",              False)
+        is_fe      = context.get("is_frontend",        False)
+        all_files  = context.get("all_files",          [])
+
+        dockerfile_path = os.path.join(folder, "Dockerfile")
+        dockerfile_text = (
+            open(dockerfile_path).read()
+            if os.path.exists(dockerfile_path) else "(not generated yet)"
+        )
+
+        # ── 2. Build a structured prompt ───────────────────────────
+        prompt = f"""You are an expert DevOps engineer explaining your work to a junior developer.
+
+Here is everything the AI agent discovered about this repository:
+
+REPOSITORY SCAN RESULTS:
+- Root files found: {all_files}
+- Detected language: {lang}
+- Detected framework: {framework}
+- ML project: {is_ml} | ML type: {ml_type} | ML libraries: {ml_libs}
+- Frontend project: {is_fe}
+- GPU usage detected: {uses_gpu}
+- Conda environment: {uses_conda}
+- Python version: {py_ver} | Node version: {node_ver}
+- Entry points found: {entries}
+
+GENERATED DOCKERFILE:
+{dockerfile_text}
+
+Now write a clear, friendly explanation in EXACTLY this structure:
+
+## 📦 What this repo contains
+(2-3 sentences. What kind of project is this? What does it do based on the files and frameworks?)
+
+## 🔍 How we detected the framework
+(2-3 sentences. What specific files or code patterns told us it's {framework}? 
+E.g. "We found fastapi in requirements.txt and @app.get decorators in main.py")
+
+## 🐳 Why the Dockerfile was generated this way
+Explain each key decision in simple language:
+- Why this base image was chosen (e.g. python:3.11-slim vs nvidia/cuda)
+- Why this CMD / startup command
+- Why these specific packages or apt libraries
+- Why this port number
+- Any special flags (e.g. --server.headless for Streamlit)
+
+## ⚠️ Things to watch out for
+(1-2 sentences. Any risks or things the developer should double-check?)
+
+Keep the tone friendly and educational. Avoid jargon. Max 300 words total.
+"""
+
+        # ── 3. Call the API and stream the explanation ─────────────
+        from openai import OpenAI
+        client = OpenAI(api_key=openai_api_key)
+
+        with st.spinner("Generating explanation..."):
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a senior DevOps engineer. "
+                            "Explain technical decisions in plain English. "
+                            "Be specific — reference actual file names and library names. "
+                            "Never be vague."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.3,
+            )
+
+        explanation = response.choices[0].message.content.strip()
+
+        # ── 4. Display in a clean expandable card ──────────────────
+        st.markdown(
+            """
+            <style>
+            .explain-card {
+                background: rgba(99, 102, 241, 0.06);
+                border: 1px solid rgba(99, 102, 241, 0.2);
+                border-left: 4px solid #6366f1;
+                border-radius: 8px;
+                padding: 1.2rem 1.4rem;
+                margin-top: 0.5rem;
+                font-size: 0.95rem;
+                line-height: 1.7;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.markdown(
+            f'<div class="explain-card">{explanation}</div>',
+            unsafe_allow_html=True,
+        )
+
+        # ── 5. Also show a quick facts table ──────────────────────
+        st.markdown("**Quick Facts**")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Language",  lang.title())
+        col2.metric("Framework", framework.title())
+        col3.metric("Entry File", os.path.basename(entries[0]) if entries else "—")
+
+        col4, col5, col6 = st.columns(3)
+        col4.metric("Python",    py_ver)
+        col5.metric("GPU",       "Yes" if uses_gpu   else "No")
+        col6.metric("ML Libs",   str(len(ml_libs)))
+
+        # ── 6. Show the Dockerfile with explanation side-by-side ──
+        if os.path.exists(dockerfile_path):
+            with st.expander("See the full Dockerfile again"):
+                st.code(open(dockerfile_path).read(), language="dockerfile")
+# ══════════════════════════════════════════════════════════════════
+# STEP 5 — PUSH + CONFLICT CHECK + CREATE PR
+# ══════════════════════════════════════════════════════════════════
+if st.session_state.stage == "push":
+    folder         = st.session_state.folder
+    fork_url       = st.session_state.fork_url
+    repo_url       = st.session_state.saved_repo_url
+    default_branch = st.session_state.default_branch
+
+    st.subheader("Push Branch & Create PR")
+
+    if st.button("Push Branch & Create PR"):
+        conflict_hit = False
+
+        with st.spinner("Committing and pushing..."):
+            try:
+                marker = os.path.join(folder, "ai_changes.txt")
+                with open(marker, "a") as fh:
+                    fh.write("AI change\n")
+                subprocess.run(["git", "add", "."], cwd=folder, check=True)
+                result = subprocess.run(
+                    ["git", "commit", "-m", "AI Docker setup"],
+                    cwd=folder, capture_output=True, text=True
+                )
+                if "nothing to commit" not in result.stdout.lower():
+                    log("Changes committed")
+
+                agent.push_branch(folder, fork_url, token)
+                log("Branch pushed to fork")
+
+            except Exception as e:
+                st.error(f"Push failed: {e}")
+                st.stop()
+
+        with st.spinner("Checking for upstream merge conflicts..."):
+            try:
+                conflict_result = agent.check_upstream_merge_conflicts(
+                    folder, repo_url, token, default_branch
+                )
+
+                if conflict_result.get("error"):
+                    log(f"Conflict check warning: {conflict_result['error']}")
+
+                if conflict_result.get("has_conflicts"):
+                    conflict_files = conflict_result["conflict_files"]
+                    conflict_text  = conflict_result["conflict_text"]
+                    log(f"Merge conflicts in: {conflict_files}")
+
+                    file_contents = {}
+                    for fn in conflict_files:
+                        fp = os.path.join(folder, fn)
+                        try:
+                            file_contents[fn] = open(fp, "r", errors="ignore").read(3000)
+                        except Exception:
+                            file_contents[fn] = "(unreadable)"
+
+                    ctx_text = "\n\n".join(f"--- {fn} ---\n{c}" for fn, c in file_contents.items())
+
+                    from openai import OpenAI
+                    client = OpenAI(api_key=openai_key)
+
+                    r1 = client.chat.completions.create(
+                        model="gpt-4o",
+                        messages=[
+                            {"role": "system", "content": "You are a Git expert. Be concise and actionable."},
+                            {"role": "user", "content": f"""
+Merge conflicts when merging 'ai-docker-setup' into '{default_branch}' in {repo_url}.
+
+CONFLICTING FILES:
+{ctx_text}
+
+CONFLICT OUTPUT:
+{conflict_text[:2000]}
+
+1. Explain each conflict
+2. Recommend: ours (ai-docker-setup) or theirs (main) and WHY
+"""}
+                        ], temperature=0.1
+                    )
+                    analysis = r1.choices[0].message.content.strip()
+
+                    r2 = client.chat.completions.create(
+                        model="gpt-4o",
+                        messages=[
+                            {"role": "system", "content": "Return ONLY valid JSON, nothing else."},
+                            {"role": "user", "content": f"""
+{conflict_text[:1500]}
+{ctx_text[:1000]}
+
+Return ONLY:
+{{"strategy":"ours or theirs","reason":"one sentence","files":[{{"file":"name","action":"ours or theirs","reason":"why"}}]}}
+"""}
+                        ], temperature=0
+                    )
+                    raw = r2.choices[0].message.content.strip()
+                    if raw.startswith("```"):
+                        raw = "\n".join(
+                            l for l in raw.splitlines() if not l.strip().startswith("```")
+                        ).strip()
+                    try:
+                        strategy = json.loads(raw)
+                    except Exception:
+                        strategy = {"strategy": "ours", "reason": "Parse error", "files": []}
+
+                    st.session_state.merge_conflict = {
+                        "files":    conflict_files,
+                        "analysis": analysis,
+                        "strategy": strategy,
+                    }
+                    st.session_state.stage = "merge_conflict"
+                    conflict_hit = True
+                    st.rerun()
+
+            except Exception as e:
+                log(f"Conflict check error: {e}")
+
+        if not conflict_hit:
+            with st.spinner("Creating pull request..."):
+                try:
+                    commit_check = subprocess.run(
+                        ["git", "log", f"upstream/{default_branch}..ai-docker-setup", "--oneline"],
+                        cwd=folder, capture_output=True, text=True
+                    )
+
+                    df_diff = subprocess.run(
+                        ["git", "diff", f"upstream/{default_branch}", "--", "Dockerfile"],
+                        cwd=folder, capture_output=True, text=True
+                    )
+                    dockerfile_differs = bool(df_diff.stdout.strip())
+
+                    if not commit_check.stdout.strip() and not dockerfile_differs:
+                        log("No new commits — Dockerfile already on upstream. Cloning fresh...")
+                        auth_url   = repo_url.replace("https://", f"https://{token}@")
+                        repo_name  = repo_url.rstrip("/").split("/")[-1].replace(".git", "")
+                        clone_dest = os.path.join(WORKSPACE, repo_name)
+                        if os.path.exists(folder):
+                            agent.safe_rmtree(folder)
+                        _git_clone(auth_url, default_branch, clone_dest)
+                        st.session_state.folder = clone_dest
+                        log(f"Fresh clone: {clone_dest}")
+                        st.session_state.stage = "pre_deploy"
+                    else:
+                        pr_url = agent.create_pull_request(
+                            repo_url, token, st.session_state.user, default_branch
+                        )
+                        st.session_state.pr_url = pr_url
+                        log(f"PR created: {pr_url}")
+                        st.session_state.stage = "pr_created"
+
+                    st.rerun()
+
+                except Exception as e:
+                    st.error(f"PR creation failed: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 5b — MERGE CONFLICT
+# ══════════════════════════════════════════════════════════════════
+if st.session_state.stage == "merge_conflict":
+    folder = st.session_state.folder
+    data   = st.session_state.merge_conflict
+
+    st.subheader("Merge Conflict Detected")
+    st.warning(f"Conflicting files: `{'`, `'.join(data['files'])}`")
+
+    with st.expander("GPT-4o Analysis", expanded=True):
+        st.markdown(data["analysis"])
+
+    strategy = data["strategy"]
+    st.markdown(f"**Recommended:** `{strategy.get('strategy','ours').upper()}` — {strategy.get('reason','')}")
+    for f_item in strategy.get("files", []):
+        st.write(f"  • `{f_item.get('file')}` → keep **{f_item.get('action','ours').upper()}** — {f_item.get('reason','')}")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        if st.button("Accept LLM Resolution & Create PR"):
+            folder         = st.session_state.folder
+            fork_url       = st.session_state.fork_url
+            repo_url       = st.session_state.saved_repo_url
+            default_branch = st.session_state.default_branch
+
+            overall  = strategy.get("strategy", "ours")
+            file_map = {fi.get("file"): fi.get("action", overall) for fi in strategy.get("files", [])}
+            for fn in data["files"]:
+                side = "--ours" if file_map.get(fn, overall) == "ours" else "--theirs"
+                subprocess.run(["git", "checkout", side, fn], cwd=folder, capture_output=True)
+                subprocess.run(["git", "add", fn],            cwd=folder, capture_output=True)
+            subprocess.run(
+                ["git", "commit", "-m", "Resolve merge conflicts (AI suggestion)"],
+                cwd=folder, capture_output=True
+            )
+            with st.spinner("Re-pushing and creating PR..."):
+                agent.push_branch(folder, fork_url, token)
+                log(f"Conflicts resolved and re-pushed ({overall})")
+                pr_url = agent.create_pull_request(
+                    repo_url, token, st.session_state.user, default_branch
+                )
+                st.session_state.pr_url = pr_url
+                log(f"PR created: {pr_url}")
+
+            st.session_state.merge_conflict = None
+            st.session_state.stage = "pr_created"
+            st.rerun()
+
+    with col2:
+        if st.button("Resolve Manually (VS Code)"):
+            _open_vscode(folder)
+            st.session_state.stage = "merge_manual"
+            st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 5c — MANUAL MERGE RESOLUTION
+# ══════════════════════════════════════════════════════════════════
+if st.session_state.stage == "merge_manual":
+    folder         = st.session_state.folder
+    fork_url       = st.session_state.fork_url
+    repo_url       = st.session_state.saved_repo_url
+    default_branch = st.session_state.default_branch
+
+    st.subheader("Manual Merge Conflict Resolution")
+    st.info(f"Open this folder in your editor: `{os.path.abspath(folder)}`")
+    st.markdown("""
+1. Find files with `<<<<<<<` markers in VS Code
+2. Keep the version you want and remove all conflict markers
+3. Save the files
+4. In your terminal: `git add .`
+5. Click **Done** below
+""")
+    if st.button("Done — Re-push & Create PR"):
+        with st.spinner("Re-pushing and creating PR..."):
+            subprocess.run(
+                ["git", "commit", "-m", "Resolve merge conflicts (manual)"],
+                cwd=folder, capture_output=True
+            )
+            agent.push_branch(folder, fork_url, token)
+            log("Re-pushed after manual merge resolution")
+            pr_url = agent.create_pull_request(
+                repo_url, token, st.session_state.user, default_branch
+            )
+            st.session_state.pr_url = pr_url
+            log(f"PR created: {pr_url}")
+        st.session_state.merge_conflict = None
+        st.session_state.stage = "pr_created"
+        st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 6 — POLL PR STATUS
+# ══════════════════════════════════════════════════════════════════
+if st.session_state.stage == "pr_created":
+    pr_url         = st.session_state.pr_url
+    folder         = st.session_state.folder
+    repo_url       = st.session_state.saved_repo_url
+    default_branch = st.session_state.default_branch
+
+    st.subheader("Pull Request")
+    st.markdown(f"**[Open PR on GitHub]({pr_url})**")
+    st.info("Review the PR on GitHub, merge it, then click Check Status.")
+
+    if st.button("Check PR Status"):
+        with st.spinner("Checking PR status..."):
+            try:
+                repo       = repo_url.replace("https://github.com/", "").rstrip("/")
+                headers    = agent.make_github_headers(token)
+                fork_owner = st.session_state.user
+                repo_owner = repo.split("/")[0]
+                head_param = "ai-docker-setup" if fork_owner == repo_owner else f"{fork_owner}:ai-docker-setup"
+
+                r_open = requests.get(
+                    f"https://api.github.com/repos/{repo}/pulls",
+                    headers=headers, params={"head": head_param, "state": "open"}
+                )
+                open_prs = r_open.json() if r_open.status_code == 200 else []
+
+                r_closed = requests.get(
+                    f"https://api.github.com/repos/{repo}/pulls",
+                    headers=headers, params={"head": head_param, "state": "closed"}
+                )
+                closed_prs = r_closed.json() if r_closed.status_code == 200 else []
+
+                if isinstance(closed_prs, list) and closed_prs and closed_prs[0].get("merged_at"):
+                    log("PR merged!")
+                    st.success("PR merged — fresh cloning...")
+
+                    auth_url   = repo_url.replace("https://", f"https://{token}@")
+                    repo_name  = repo_url.rstrip("/").split("/")[-1].replace(".git", "")
+                    clone_dest = os.path.join(WORKSPACE, repo_name)
+                    if os.path.exists(folder):
+                        agent.safe_rmtree(folder)
+                    _git_clone(auth_url, default_branch, clone_dest)
+                    st.session_state.folder = clone_dest
+                    log(f"Fresh clone: {clone_dest}")
+
+                    _open_vscode(clone_dest)
+
+                    st.session_state.stage = "fresh_cloned"
+                    st.rerun()
+
+                elif isinstance(closed_prs, list) and closed_prs and not closed_prs[0].get("merged_at"):
+                    st.error("PR was closed/rejected. Fix your changes and push again.")
+                    log("PR closed/rejected")
+
+                elif isinstance(open_prs, list) and open_prs:
+                    pr      = open_prs[0]
+                    m_state = pr.get("mergeable_state", "unknown")
+                    if m_state in ("dirty", "blocked", "behind"):
+                        st.warning(f"PR has issues: `{m_state}` — resolve conflicts on GitHub then check again")
+                    else:
+                        st.info(f"PR is open (`{m_state}`) — merge it on GitHub, then check again")
+                else:
+                    st.warning("PR not found yet — try again in a moment")
+
+            except Exception as e:
+                st.error(str(e))
+
+
+# ══════════════════════════════════════════════════════════════════
+# PRE-DEPLOY (Dockerfile already existed — PR skipped)
+# ══════════════════════════════════════════════════════════════════
+if st.session_state.stage == "pre_deploy":
+    folder = st.session_state.folder
+    _open_vscode(folder)
+    st.session_state.stage = "fresh_cloned"
+    st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 6b — FRESH CLONE REVIEW: .env setup + VS Code
+# ══════════════════════════════════════════════════════════════════
+if st.session_state.stage == "fresh_cloned":
+    folder = st.session_state.folder
+
+    st.subheader("Fresh Clone Ready — Review & Setup")
+    st.info(f"Open this folder in your editor: `{os.path.abspath(folder)}`")
+    st.markdown("Review the code in VS Code. Since `.env` is gitignored, set your environment variables below before testing.")
+
+    env_file = os.path.join(folder, ".env")
+    if os.path.exists(env_file):
+        st.success("Found existing `.env` — edit below or leave as-is.")
+        existing_env = open(env_file).read()
+    else:
+        st.warning("No `.env` found (gitignored). Add your environment variables below:")
+        existing_env = ""
+
+    env_text = st.text_area("Environment Variables (KEY=VALUE, one per line)", existing_env, key="fresh_env_area")
+
+    st.divider()
+    if st.button("Save .env & Run Local Test"):
+        env_vars = {}
+        for line in env_text.strip().splitlines():
+            line = line.strip()
+            if "=" in line and not line.startswith("#"):
+                k, _, v = line.partition("=")
+                env_vars[k.strip()] = v.strip()
+        if env_vars:
+            with open(env_file, "w") as fh:
+                for k, v in env_vars.items():
+                    fh.write(f"{k}={v}\n")
+            gi_path = os.path.join(folder, ".gitignore")
+            if os.path.exists(gi_path):
+                gi_content = open(gi_path).read()
+                if ".env" not in gi_content:
+                    open(gi_path, "a").write("\n.env\n")
+            log(f"Saved {len(env_vars)} env vars to .env")
+        st.session_state.stage = "local_testing"
+        st.rerun()
+
+    if st.button("Skip .env & Go to Deploy"):
+        log("Skipped local test — going to deploy")
+        _patch_input()
+        try:
+            st.session_state.context = agent.deep_scan_repo(folder)
+        finally:
+            _restore_input()
+        st.session_state.stage = "deploy_approval"
+        st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 6c — LOCAL TESTING
+# ══════════════════════════════════════════════════════════════════
+def _find_free_port(preferred):
+    import socket
+    preferred = int(preferred)
+    for port in range(preferred, preferred + 20):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("", port))
+                return str(port)
+            except OSError:
+                continue
+    return str(preferred)
+
+
+def _start_local_server(folder, ctx):
+    folder    = os.path.abspath(folder)
+    framework = ctx.get("detected_framework", "unknown")
+    ml_type   = ctx.get("ml_type", "unknown")
+    entries   = ctx.get("entry_points_found", [])
+    entry     = entries[0] if entries else ""
+
+    port_map = {
+        "streamlit": "8502", "gradio": "7860",
+        "fastapi": "8000", "fastapi_ml": "8000",
+        "flask": "5000",   "flask_ml": "5000",
+        "django": "8000",  "express": "3000", "fastify": "3000",
+    }
+    key       = ml_type if ml_type not in ("unknown", "none", "") else framework
+    preferred = agent.detect_port_from_dockerfile(folder) or port_map.get(key, "8000")
+    test_port = _find_free_port(preferred)
+
+    venv_dir    = os.path.join(folder, "_test_venv")
+    subprocess.run([sys.executable, "-m", "venv", venv_dir], capture_output=True, text=True)
+    venv_python = (
+        os.path.join(venv_dir, "Scripts", "python.exe") if os.name == "nt"
+        else os.path.join(venv_dir, "bin", "python")
+    )
+
+    req_path = os.path.join(folder, "requirements.txt")
+    if os.path.exists(req_path):
+        subprocess.run(
+            [venv_python, "-m", "pip", "install", "-r", "requirements.txt", "--quiet"],
+            cwd=folder, capture_output=True
+        )
+
+    cmd             = None
+    success_signals = []
+
+    if framework == "fastapi" or ml_type == "fastapi_ml":
+        subprocess.run([venv_python, "-m", "pip", "install", "uvicorn", "--quiet"], capture_output=True)
+        e       = ctx.get("fastapi_entry_file", entry)
+        mod     = e.replace("\\", "/").replace("/", ".").replace(".py", "")
+        app_var = ctx.get("app_variable_name", "app")
+        cmd     = [venv_python, "-m", "uvicorn", f"{mod}:{app_var}", "--host", "0.0.0.0", "--port", str(test_port)]
+        success_signals = ["application startup complete", "uvicorn running"]
+
+    elif ml_type == "streamlit" or framework == "streamlit":
+        subprocess.run([venv_python, "-m", "pip", "install", "streamlit", "--quiet"], capture_output=True)
+        e   = ctx.get("streamlit_entry_file", entry)
+        cmd = [venv_python, "-m", "streamlit", "run", e,
+               "--server.headless=true", f"--server.port={test_port}", "--server.address=0.0.0.0"]
+        success_signals = ["you can now view", "network url", "local url", "http://"]
+
+    elif ml_type == "gradio" or framework == "gradio":
+        subprocess.run([venv_python, "-m", "pip", "install", "gradio", "--quiet"], capture_output=True)
+        e   = ctx.get("gradio_entry_file", entry)
+        cmd = [venv_python, e]
+        success_signals = ["running on", "local url", "gradio"]
+
+    elif framework == "flask" or ml_type == "flask_ml":
+        subprocess.run([venv_python, "-m", "pip", "install", "flask", "--quiet"], capture_output=True)
+        e   = ctx.get("flask_entry_file", entry)
+        mod = e.replace("\\", "/").replace(".py", "").replace("/", ".")
+        cmd = [venv_python, "-m", "flask", "--app", mod, "run", "--host=0.0.0.0", f"--port={test_port}"]
+        success_signals = ["running on", "debugger is active"]
+
+    elif framework == "django":
+        subprocess.run([venv_python, "-m", "pip", "install", "django", "--quiet"], capture_output=True)
+        cmd = [venv_python, "manage.py", "runserver", f"0.0.0.0:{test_port}"]
+        success_signals = ["starting development server", "quit the server"]
+
+    if not cmd:
+        return None, venv_dir, test_port, []
+
+    proc_env = os.environ.copy()
+    env_file = os.path.join(folder, ".env")
+    if os.path.exists(env_file):
+        for _line in open(env_file):
+            _line = _line.strip()
+            if "=" in _line and not _line.startswith("#"):
+                _k, _, _v = _line.partition("=")
+                proc_env[_k.strip()] = _v.strip()
+
+    collected_lines = []
+    lock = threading.Lock()
+
+    proc = subprocess.Popen(
+        cmd, cwd=folder,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        encoding="utf-8", errors="replace",
+        env=proc_env,
+    )
+
+    def reader(stream):
+        try:
+            for raw_line in iter(stream.readline, ""):
+                line = raw_line.rstrip()
+                if line:
+                    with lock:
+                        collected_lines.append(line)
+        except Exception:
+            pass
+
+    threading.Thread(target=reader, args=(proc.stdout,), daemon=True).start()
+    threading.Thread(target=reader, args=(proc.stderr,), daemon=True).start()
+
+    start_time = time.time()
+    timeout    = 45
+
+    FATAL_KEYWORDS = [
+        "modulenotfounderror", "importerror", "no module named",
+        "syntaxerror", "traceback (most recent", "typeerror", "error:",
+        "address already in use",
+    ]
+
+    while time.time() - start_time < timeout:
+        with lock:
+            lines_lower = [l.lower() for l in collected_lines]
+        if any(sig in l for l in lines_lower for sig in success_signals):
+            break
+
+        if any(kw in l for l in lines_lower for kw in FATAL_KEYWORDS):
+            with lock:
+                fatal_log = "\n".join(collected_lines)
+            import re
+            
+# Find ALL file references, prefer user files over venv/framework files
+            all_matches = re.findall(r'File "([^"]+\.py)", line (\d+)', fatal_log)
+            # Filter out venv/framework files, prefer user project files
+            user_matches = [
+                (f, l) for f, l in all_matches
+                if "_test_venv" not in f
+                and "site-packages" not in f
+                and "streamlit" not in f.lower()
+            ]
+            file_match_tuple = user_matches[-1] if user_matches else (all_matches[-1] if all_matches else None)
+            if file_match_tuple and openai_key:
+                failing_file, failing_line = file_match_tuple
+                if os.path.isfile(failing_file):
+                    try:
+                        from openai import OpenAI
+                        file_src = open(failing_file, "r", errors="ignore").read()
+                        client   = OpenAI(api_key=openai_key)
+                        resp     = client.chat.completions.create(
+                            model="gpt-4o",
+                            messages=[
+                                {"role": "system", "content": "You are a Python expert. Fix the bug in the file. Return ONLY the complete fixed file content, no markdown, no backticks."},
+                                {"role": "user",   "content": f"ERROR:\n{fatal_log[-2000:]}\n\nFILE ({failing_file}):\n{file_src}"}
+                            ],
+                            temperature=0.1,
+                        )
+                        fixed_src = resp.choices[0].message.content.strip()
+                        if fixed_src.startswith("```"):
+                            fixed_src = "\n".join(
+                                l for l in fixed_src.splitlines()
+                                if not l.strip().startswith("```")
+                            ).strip()
+                        with open(failing_file, "w", encoding="utf-8") as _f:
+                            _f.write(fixed_src)
+                        try:
+                            proc.kill()
+                            proc.wait(timeout=5)
+                        except Exception:
+                            pass
+                        with lock:
+                            collected_lines.clear()
+                        proc = subprocess.Popen(
+                            cmd, cwd=folder,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, encoding="utf-8", errors="replace",
+                            env=proc_env,
+                        )
+                        threading.Thread(target=reader, args=(proc.stdout,), daemon=True).start()
+                        threading.Thread(target=reader, args=(proc.stderr,), daemon=True).start()
+                        start_time = time.time()
+                        time.sleep(0.3)
+                        continue
+                    except Exception:
+                        pass
+            break
+
+        if proc.poll() is not None:
+            break
+        time.sleep(0.3)
+
+    time.sleep(0.5)
+    with lock:
+        final_lines = list(collected_lines)
+
+    return proc, venv_dir, test_port, final_lines
+
+if st.session_state.stage == "local_testing":
+    folder = st.session_state.folder
+
+    # ── Universal DB detection — works for ALL languages ──
+    DB_SIGNALS = {
+        # Python
+        "psycopg2", "asyncpg", "pymysql", "mysqlclient",
+        "pymongo", "motor", "aiomysql", "aiopg",
+        # Node.js
+        "pg", "mysql2", "mongoose", "mongodb",
+        "sequelize", "typeorm", "prisma",
+        # Ruby
+        "pg", "mysql2", "mongoid", "activerecord",
+        # Java
+        "jdbc", "hibernate", "jpa",
+        # Go
+        "database/sql", "gorm", "mongo-driver",
+    }
+
+    # Check ALL dependency files — not just requirements.txt
+    DEP_FILES = [
+        "requirements.txt", "Pipfile", "pyproject.toml",
+        "package.json", "Gemfile", "pom.xml",
+        "go.mod", "Cargo.toml", "composer.json",
+    ]
+
+    combined_dep_content = ""
+    for dep_file in DEP_FILES:
+        dep_path = os.path.join(folder, dep_file)
+        if os.path.exists(dep_path):
+            try:
+                combined_dep_content += open(dep_path).read().lower()
+            except Exception:
+                pass
+
+    # Also check source files for DB connection strings
+    SOURCE_SIGNALS = [
+        "database_url", "db_host", "db_url",
+        "mongodb_uri", "postgres_uri",
+        "sqlalchemy.create_engine", "mongoose.connect",
+        "prisma.connect", "gorm.open",
+    ]
+
+    source_content = ""
+    for walk_root, walk_dirs, walk_files in os.walk(folder):
+        walk_dirs[:] = [d for d in walk_dirs if d not in
+                        (".git", "__pycache__", "node_modules", "_test_venv")]
+        for fname in walk_files:
+            if any(fname.endswith(ext) for ext in [".py", ".js", ".ts", ".go", ".rb"]):
+                try:
+                    fpath = os.path.join(walk_root, fname)
+                    source_content += open(fpath, errors="ignore").read().lower()
+                except Exception:
+                    pass
+
+    db_in_deps    = any(sig in combined_dep_content for sig in DB_SIGNALS)
+    db_in_source  = any(sig in source_content       for sig in SOURCE_SIGNALS)
+    db_detected   = db_in_deps or db_in_source
+
+    if db_detected:
+        reason = "dependency file" if db_in_deps else "source code"
+        st.warning(f"🗄️ Database detected in {reason} — local test skipped automatically")
+        st.info("Your Docker build already passed ✅ — that's the real validation. Local test needs a running DB which isn't available here.")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Continue to Deploy →"):
+                _patch_input()
+                try:
+                    st.session_state.context = agent.deep_scan_repo(folder)
+                finally:
+                    _restore_input()
+                st.session_state.stage = "deploy_approval"
+                st.rerun()
+        with col2:
+            if st.button("Run Local Test Anyway"):
+                pass  # falls through to normal local test below
+        st.stop()
+if st.session_state.stage == "local_testing":
+    folder = st.session_state.folder
+
+    st.subheader("Local Test")
+    st.info("This will install dependencies in an isolated venv, start your app, and let you verify it in the browser before deploying.")
+
+    if st.button("Start Local Test Server"):
+        test_folder = f"{folder}_test"
+        if os.path.exists(test_folder):
+            agent.safe_rmtree(test_folder)
+
+        with st.spinner("Copying repo to isolated test folder..."):
+            shutil.copytree(folder, test_folder, ignore=shutil.ignore_patterns("_test_venv", ".git"))
+            env_src = os.path.join(folder, ".env")
+            if os.path.exists(env_src):
+                shutil.copy2(env_src, os.path.join(test_folder, ".env"))
+
+        with st.spinner("Scanning repo..."):
+            _patch_input()
+            try:
+                ctx = agent.deep_scan_repo(test_folder)
+            finally:
+                _restore_input()
+            st.session_state.test_ctx = ctx
+
+        with st.spinner("Installing dependencies & starting server (up to 45s)..."):
+            proc, venv_dir, test_port, server_logs = _start_local_server(test_folder, ctx)
+
+        if proc is not None and proc.poll() is None:
+            st.session_state.test_proc   = proc
+            st.session_state.test_folder = test_folder
+            st.session_state.test_port   = test_port
+            st.session_state.test_venv   = venv_dir
+            log(f"Local test server started on port {test_port}")
+            st.session_state.stage = "server_running"
+            st.rerun()
+        else:
+            st.error("Server process exited before becoming ready.")
+            if server_logs:
+                with st.expander("Server output (crash log)", expanded=True):
+                    st.code("\n".join(server_logs[-100:]))
+            else:
+                st.warning("No output captured. The process may have failed silently.")
+            st.info("Common causes: missing env var, import error, port already in use, or DB unreachable at startup.")
+            if os.path.exists(test_folder):
+                agent.safe_rmtree(test_folder)
+
+    if st.button("Skip Local Test — Go to Deploy"):
+        log("Local test skipped by user")
+        _patch_input()
+        try:
+            st.session_state.context = agent.deep_scan_repo(folder)
+        finally:
+            _restore_input()
+        st.session_state.stage = "deploy_approval"
+        st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 6c (continued) — SERVER RUNNING
+# ══════════════════════════════════════════════════════════════════
+if st.session_state.stage == "server_running":
+    port        = st.session_state.get("test_port", "8000")
+    folder      = st.session_state.folder
+    test_folder = st.session_state.get("test_folder")
+
+    st.subheader("Local Server Running — Test Your App")
+    st.success("Server started successfully! Open the links below to verify your app.")
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.markdown(f"**[http://localhost:{port}](http://localhost:{port})**")
+    with col_b:
+        st.markdown(f"**[http://127.0.0.1:{port}](http://127.0.0.1:{port})**")
+
+    st.info("Test your app in the browser, then click **Stop Server & Continue** to proceed to deployment.")
+
+    if st.button("Stop Server & Continue to Deploy"):
+        proc = st.session_state.get("test_proc")
+        if proc:
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+            import time; time.sleep(1.5)
+        if test_folder and os.path.exists(test_folder):
+            agent.safe_rmtree(test_folder)
+        st.session_state.test_proc   = None
+        st.session_state.test_folder = None
+        log("Local test server stopped — proceeding to deploy")
+        _patch_input()
+        try:
+            st.session_state.context = agent.deep_scan_repo(folder)
+        finally:
+            _restore_input()
+        st.session_state.stage = "deploy_approval"
+        st.rerun()
+
+    if st.button("Stop Server & Skip Deploy"):
+        proc = st.session_state.get("test_proc")
+        if proc:
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+        if test_folder and os.path.exists(test_folder):
+            agent.safe_rmtree(test_folder)
+        st.session_state.test_proc   = None
+        st.session_state.test_folder = None
+        log("Local test server stopped — skipping deploy")
+        st.session_state.stage = "done_no_deploy"
+        st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 7 — DEPLOY APPROVAL
+# ══════════════════════════════════════════════════════════════════
+if st.session_state.stage == "deploy_approval":
+    st.subheader("Deploy?")
+    st.success("Code is pushed, PR merged, and local test complete. Deploy now?")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Yes — Deploy"):
+            log("Deploy approved")
+            st.session_state.stage = "local_done"
+            st.rerun()
+    with col2:
+        if st.button("No — Skip Deployment"):
+            log("Deploy skipped by user")
+            st.session_state.stage = "done_no_deploy"
+            st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 8 — COLLECT DEPLOY INFO + DEPLOY
+# ══════════════════════════════════════════════════════════════════
+if st.session_state.stage == "local_done":
+    folder   = st.session_state.folder
+    fork_url = st.session_state.fork_url
+    repo_url = st.session_state.saved_repo_url
+
+    st.subheader("Deployment")
+
+    deploy_target = st.selectbox("Where to deploy?", ["render", "railway", "aws", "azure"])
+    app_name      = st.text_input("App Name")
+
+    st.markdown("**Environment Variables**")
+    env_file = os.path.join(folder, ".env")
+    pre_env  = open(env_file).read() if os.path.exists(env_file) else ""
+    env_text = st.text_area("KEY=VALUE (one per line)", pre_env, key="deploy_env")
+    env_vars = {}
+    for line in env_text.strip().splitlines():
+        line = line.strip()
+        if "=" in line and not line.startswith("#"):
+            k, _, v = line.partition("=")
+            env_vars[k.strip()] = v.strip()
+
+    st.markdown("**Credentials**")
+    creds = {}
+
+    if deploy_target == "aws":
+        creds["aws"] = {
+            "access_key": st.text_input("AWS_ACCESS_KEY_ID"),
+            "secret_key": st.text_input("AWS_SECRET_ACCESS_KEY", type="password"),
+            "region":     st.text_input("AWS_REGION", value="us-east-1"),
+            "app_name":   app_name,
+        }
+    elif deploy_target == "azure":
+        creds["azure"] = {
+            "client_id":       st.text_input("AZURE_CLIENT_ID"),
+            "client_secret":   st.text_input("AZURE_CLIENT_SECRET",   type="password"),
+            "tenant_id":       st.text_input("AZURE_TENANT_ID"),
+            "subscription_id": st.text_input("AZURE_SUBSCRIPTION_ID"),
+            "resource_group":  st.text_input("AZURE_RESOURCE_GROUP"),
+            "dockerhub_user":  st.text_input("Docker Hub Username"),
+            "dockerhub_pass":  st.text_input("Docker Hub Password",    type="password"),
+            "app_name":        app_name,
+        }
+    elif deploy_target == "render":
+        _render_env = {}
+        if os.path.exists(os.path.join(folder, ".env")):
+            for _line in open(os.path.join(folder, ".env")).readlines():
+                _line = _line.strip()
+                if "=" in _line and not _line.startswith("#"):
+                    _k, _, _v = _line.partition("=")
+                    _render_env[_k.strip()] = _v.strip()
+        _render_key_default = _render_env.get("RENDER_API_KEY", "")
+        render_api_key = st.text_input("RENDER_API_KEY", value=_render_key_default, type="password")
+        creds["render"] = {
+            "api_key":  render_api_key,
+            "app_name": app_name,
+        }
+    elif deploy_target == "railway":
+        creds["railway"] = {
+            "token":          st.text_input("RAILWAY_TOKEN"),
+            "dockerhub_user": st.text_input("Docker Hub Username"),
+            "dockerhub_pass": st.text_input("Docker Hub Password", type="password"),
+            "app_name":       app_name,
+        }
+
+    # ── Auto-block deploy if DB app missing DATABASE_URL ──────────
+    req_path = os.path.join(folder, "requirements.txt")
+    req_text = open(req_path).read().lower() if os.path.exists(req_path) else ""
+    DB_DRIVERS = ["psycopg2", "asyncpg", "pymysql", "pymongo", "motor"]
+
+    if any(kw in req_text for kw in DB_DRIVERS):
+        if "DATABASE_URL" not in env_vars:
+            st.error(
+                "⚠️ Database app detected but DATABASE_URL is missing! "
+                "Your app will crash on Railway without it. "
+                "Add it above: DATABASE_URL=postgresql://user:pass@host:5432/dbname"
+            )
+            st.info(
+                "Get a free Postgres DB from Neon.tech or Supabase, "
+                "then paste the connection string into the env vars box above."
+            )
+            st.stop()
+
+    if st.button("Deploy Now"):
+        for platform in creds:
+            creds[platform]["fork_url"] = fork_url
+            creds[platform]["folder"]   = folder
+            creds[platform]["env_vars"] = env_vars
+
+        with st.spinner(f"Deploying to {deploy_target}..."):
+            try:
+                results = agent.deploy_to_platforms([deploy_target], folder, fork_url, creds)
+                st.session_state.deploy_results = results
+                log(f"Deploy complete: {results}")
+                st.session_state.stage = "deployed"
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
+    
+    
+
+# ══════════════════════════════════════════════════════════════════
+# DONE — NO DEPLOY
+# ══════════════════════════════════════════════════════════════════
+if st.session_state.stage == "done_no_deploy":
+    st.success("Pipeline complete! Deployment skipped.")
+    if st.button("Start Over"):
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
+        st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════
+# DONE — DEPLOYED
+# ══════════════════════════════════════════════════════════════════
+if st.session_state.stage == "deployed":
+    st.success("Deployment complete!")
+    for platform, url in st.session_state.deploy_results.items():
+        icon = "✅" if not str(url).startswith("FAILED") else "❌"
+        if str(url).startswith("http"):
+            st.markdown(f"{icon} **{platform.upper()}**: [{url}]({url})")
+        else:
+            st.write(f"{icon} **{platform.upper()}**: {url}")
+
+    if st.button("Start Over"):
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
+        st.rerun()

@@ -11,6 +11,7 @@ RUN apt-get update && \
 
 COPY requirements.txt* ./
 RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi
+
 RUN pip install --no-cache-dir streamlit
 
 COPY . .
